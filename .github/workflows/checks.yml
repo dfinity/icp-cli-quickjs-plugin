@@ -21,7 +21,6 @@ jobs:
         with:
           cache-shared-key: ${{ runner.os }}-checks
           cache-bin: false
-          target: wasm32-wasip2
 
       - name: Check fmt
         run: cargo fmt --all -- --check
