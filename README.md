@@ -1,8 +1,7 @@
-# icp-js-plugin
+# icp-cli-quickjs-plugin
 
 An [icp-cli](https://github.com/dfinity/icp-cli) **sync plugin** that runs a
-JavaScript script against the canister being synced. It implements the
-`icp:sync-plugin` WIT world (see [`sync-plugin.wit`](sync-plugin.wit)) and
+JavaScript script against the canister being synced. It
 exposes to the script roughly the same capabilities a native sync plugin has —
 calling the target canister, reading its metadata, setting its environment
 variables, the sync inputs, and read-only filesystem access — plus Candid,
@@ -70,16 +69,6 @@ strings into principals itself:
 ```js
 const config = JSON.parse(files["config.json"]);
 callTyped("example", "set_authorized", config.authorized);
-```
-
-Bump a counter on the canister being synced and report the new value:
-
-```js
-console.error("count before sync: " + callTyped(self, "get"));
-
-callTyped(self, "increment");
-
-console.error("count after sync: " + callTyped(self, "get"));
 ```
 
 ## What a script gets
