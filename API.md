@@ -12,7 +12,6 @@ the language plus the host functions documented here.
 - [Sync inputs (globals)](#sync-inputs-globals)
 - [Canister calls](#canister-calls)
 - [Metadata sections](#metadata-sections)
-- [Environment variables](#environment-variables)
 - [Candid](#candid)
 - [Number types](#number-types)
 - [Exact-encoding classes](#exact-encoding-classes)
@@ -38,15 +37,16 @@ sync:
       files:
         script: sync.js
         seed: [seed/users.json, seed/roles.json]
-      dirs:
         assets: assets
 ```
 
-Every declared file — the entry script included — is read by the host and handed
-to the script via the `files` object, keyed by path. Directories declared in
-`dirs` are preopened read-only and reachable with the filesystem functions below.
-Declaring `files:`/`dirs:` as a map instead of a plain list tags each entry with
-its key, which the script reads back through `fileKeys` / `dirKeys`.
+`files:` is a map of name → path (or list of paths), and holds directories as
+well as files; the host sorts them by what it finds on disk. Every declared
+file — the entry script included — is read by the host and handed to the script
+via the `files` object, keyed by path. Every declared directory is preopened
+read-only and reachable with the filesystem functions below, and appears in
+`dirs`. Each entry keeps the key it was declared under, which the script reads
+back through `fileKeys` / `dirKeys`.
 
 A script runs to completion for a clean sync; throwing (or a runtime error)
 fails the step with the thrown message.
@@ -69,6 +69,8 @@ suspends itself.
 | `identityId`  | `string`                    | Textual principal of the signing identity.            |
 | `identity`    | `Principal`                 | The signing identity as a `Principal`.                |
 | `proxy`       | `Principal` \| `null`       | Proxy canister if `--proxy` was set, else `null`.     |
+| `apiUrl`      | `string`                    | The network's API endpoint, with a trailing slash.    |
+| `gatewayUrl`  | `string` \| `null`          | The network's HTTP gateway, or `null` if it has none. |
 | `dirs`        | `string[]`                  | Declared directory paths (preopened read-only).       |
 | `dirKeys`     | `object` (key → `string[]`) | Manifest key → the directory paths declared under it. |
 | `files`       | `object` (path → `string`)  | Contents of every declared file, by path.             |
@@ -76,14 +78,20 @@ suspends itself.
 | `fields`      | `object` (name → `string`)  | Key-value fields declared in the step's `fields`.     |
 | `canisterIds` | `object` (name → `string`)  | Every project canister's name → textual principal.    |
 
-`dirKeys` and `fileKeys` cover only the entries declared under a map key; a
-plain-list `dirs:`/`files:` has none, and appears only in `dirs`/`files`. One key
-may name several paths, so each maps to an array:
+Every `files:` entry is declared under a key, so `dirKeys` and `fileKeys`
+between them cover all of `dirs` and `files`. One key may name several paths, so
+each maps to an array:
 
 ```js
 // Contents of every file declared under the `seed` key.
 let seeds = fileKeys.seed.map((path) => files[path]);
 ```
+
+`apiUrl` and `gatewayUrl` say where the network is reached, normalized so a URL
+with no path carries a trailing slash (`"http://127.0.0.1:4943/"`). They are
+there to compose a URL from — to hand to a canister, or to print — not to fetch:
+the plugin has no sockets, and the host makes every canister call on the
+script's behalf.
 
 `canisterIds` is informational: it maps each named canister in the project
 (both `subproject:local` keys and bare local names for same-subproject siblings)
@@ -150,35 +158,6 @@ reader may not have is an error. A `direct` read is a certified `read_state`
 signed by the sync identity, which reaches a private section only if that
 identity controls the target; a proxied read reaches one private to the proxy's
 control.
-
-## Environment variables
-
-`canisterSetenv` sets one of a canister's runtime environment variables, leaving
-its other variables — and the rest of its settings — as they are. It names its
-receiver first, as a call shorthand does.
-
-```js
-canisterSetenv(self, "SEEDED_BY", environment);
-canisterSetenv("ledger", "ADMIN", canisterIds.backend);
-
-// Optional trailing options; `direct` is the only one.
-canisterSetenv(self, "ADMIN", identityId, { direct: true });
-```
-
-The value is a string: the canister reads it back verbatim, so anything else is
-the script's to render (`String(x)`, or `x.toText()` for a `Principal`). The
-update is controller-gated — with `direct` the sync identity must control the
-receiver, and by default the proxy configured via `--proxy` makes it, so that is
-what must control it. With no proxy configured the sync identity signs either
-way.
-
-Set the variable on every sync rather than once. The management canister can only
-replace a canister's variables as a whole list, so the host reads them and writes
-them back with yours added — and a later `icp deploy` rewrites that list from the
-manifest, dropping what a plugin added. Deploy runs the sync phase afterwards, so
-a script that always sets it always restores it. For a variable that should not
-depend on the plugin running, declare it in the manifest's
-`environment_variables` setting instead.
 
 ## Candid
 
@@ -458,7 +437,7 @@ call returns at most 1 MiB.
 
 ## Filesystem
 
-Read-only access to the directories the step declared under `dirs:`, backed by
+Read-only access to the directories the step declared under `files:`, backed by
 WASI. Each is readable at the path the manifest declared it at, and nothing
 outside them is readable at all.
 
@@ -492,10 +471,10 @@ for (const name of readDir("assets")) {
 
 The reads throw with the underlying error; the predicates answer `false`
 instead, so a path that may not be there — or may not be reachable — can be
-asked about. Since only the declared `dirs:` are readable, a failed read also
-says what the step declared, and a path naming a declared *file* says to read it
-from `files`: the host passes those contents inline rather than putting them on
-the filesystem.
+asked about. Since only the declared directories are readable, a failed read
+also says which ones the step declared, and a path naming a declared *file* says
+to read it from `files`: the host passes those contents inline rather than
+putting them on the filesystem.
 
 `joinPath` separates the parts it is given with single slashes however they are
 punctuated, dropping empty ones. A part that starts at the root replaces what

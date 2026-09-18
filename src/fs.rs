@@ -1,12 +1,12 @@
 //! Read-only filesystem access, over the directories the manifest step
-//! declared under `dirs:`.
+//! declared under `files:`.
 //!
 //! QuickJS has no filesystem of its own, so these are plain globals backed by
 //! `std::fs`, which under `wasm32-wasip2` reaches exactly the directories the
-//! host preopened — every declared `dirs:` entry, at the path it was declared
-//! at, and nothing else. Writes are absent because those preopens are
-//! read-only; a script that needs to hand something back makes a canister call
-//! with it.
+//! host preopened — every `files:` entry that turned out to be a directory, at
+//! the path it was declared at, and nothing else. Writes are absent because
+//! those preopens are read-only; a script that needs to hand something back
+//! makes a canister call with it.
 //!
 //! ```js
 //! for (const name of readDir("assets")) {
@@ -226,7 +226,7 @@ fn fail(ctx: &Ctx<'_>, what: &str, path: &str, err: &std::io::Error) -> rquickjs
 
 /// The advice an unreadable path deserves.
 ///
-/// The filesystem holds the directories the step declared under `dirs:` and
+/// The filesystem holds the directories the step declared under `files:` and
 /// nothing else, so a path outside every one of them is the usual reason a read
 /// fails — and it fails with a WASI error about preopened descriptors, which
 /// says nothing about the manifest the reader would have to fix. A path that
@@ -257,9 +257,10 @@ fn path_hint(ctx: &Ctx<'_>, path: &str) -> String {
         return String::new();
     }
     match dirs.len() {
-        0 => "; the step declares no `dirs:`, so no path is readable".to_string(),
+        0 => "; the step's `files:` declares no directory, so no path is readable".to_string(),
         _ => format!(
-            "; the step's `dirs:` declares {}, and a path outside those is not readable",
+            "; the step's `files:` declares the directories {}, and a path outside those is not \
+             readable",
             dirs.iter()
                 .map(|d| format!("'{d}'"))
                 .collect::<Vec<_>>()
@@ -428,14 +429,14 @@ mod tests {
             reported.contains("readFile('elsewhere/data.json') failed"),
             "{reported}"
         );
-        assert!(reported.contains("declares no `dirs:`"), "{reported}");
+        assert!(reported.contains("declares no directory"), "{reported}");
     }
 
     #[test]
     fn a_declared_file_is_reported_as_one_the_host_passed_inline() {
         let mut input = testing::input("readFile('seed.json');");
         input.files.push(crate::FileInput {
-            key: None,
+            key: "seed".into(),
             name: "seed.json".into(),
             content: "{}".into(),
         });
@@ -447,7 +448,7 @@ mod tests {
     fn a_path_under_a_declared_dir_is_reported_as_it_failed() {
         let mut input = testing::input("readDir('assets/missing');");
         input.dirs.push(crate::DirInput {
-            key: None,
+            key: "assets".into(),
             path: "assets".into(),
         });
         let reported = crate::engine::run(input).unwrap_err();
@@ -457,6 +458,6 @@ mod tests {
         );
         // The step declared the tree the path sits in, so there is no manifest
         // advice to give — only the failure itself.
-        assert!(!reported.contains("`dirs:`"), "{reported}");
+        assert!(!reported.contains("`files:`"), "{reported}");
     }
 }

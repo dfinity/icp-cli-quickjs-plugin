@@ -8,6 +8,8 @@ pub fn input(script: &str) -> SyncExecInput {
     SyncExecInput {
         canister_id: "ryjl3-tyaaa-aaaaa-aaaba-cai".to_string(),
         environment: "local".to_string(),
+        api_url: "http://127.0.0.1:4943/".to_string(),
+        gateway_url: None,
         dirs: vec![],
         files: vec![],
         fields: vec![FieldInput {
