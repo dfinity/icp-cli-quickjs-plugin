@@ -1,6 +1,6 @@
 //! Builds the QuickJS context the plugin runs scripts on, wiring in every
-//! capability a sync plugin has: canister calls, environment variable updates,
-//! the sync inputs, read-only filesystem access over WASI, and
+//! capability a sync plugin has: canister calls, metadata reads, the sync
+//! inputs, read-only filesystem access over WASI, and
 //! Candid/principal/encoding helpers.
 
 use ::candid::Principal as CandidPrincipal;
@@ -16,10 +16,7 @@ use crate::convert;
 use crate::icp::sync_plugin::types::{CallTarget, CallType};
 use crate::interface::SelfTarget;
 use crate::principal::{self, Principal};
-use crate::{
-    CanisterCallRequest, SetEnvironmentVariableRequest, SyncExecInput, canister_call,
-    canister_set_environment_variable,
-};
+use crate::{CanisterCallRequest, SyncExecInput, canister_call};
 use crate::{exact, fs, interface, number};
 
 /// Run the entry script with all capabilities wired in. Returns the plugin's
@@ -163,10 +160,7 @@ impl RejectionLog {
 /// Resolve the entry script to a `(name for error messages, source)` pair.
 fn entry_script(input: &SyncExecInput) -> Result<(String, String), String> {
     let field = input.fields.iter().find(|f| f.name == "script");
-    let mut files = input
-        .files
-        .iter()
-        .filter(|f| f.key.as_deref() == Some("script"));
+    let mut files = input.files.iter().filter(|f| f.key == "script");
     let file = files.next();
 
     if let Some(extra) = files.next() {
@@ -199,7 +193,6 @@ fn install(ctx: &Ctx<'_>, input: &SyncExecInput) -> JsResult<()> {
     exact::register(ctx)?;
     register_output(ctx)?;
     register_canister_calls(ctx)?;
-    register_environment(ctx)?;
     candid::register(ctx)?;
     interface::register(ctx)?;
     register_encoding(ctx)?;
@@ -446,100 +439,6 @@ fn name_hint(ctx: &Ctx<'_>, principal: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// Canister environment variables
-// ---------------------------------------------------------------------------
-
-/// Register `canisterSetenv`.
-fn register_environment(ctx: &Ctx<'_>) -> JsResult<()> {
-    ctx.globals().set(
-        "canisterSetenv",
-        Function::new(ctx.clone(), canister_setenv_js)?,
-    )
-}
-
-/// `canisterSetenv(receiver, name, value, options)` — the receiver first, the
-/// way a call shorthand names its own.
-///
-/// Sets one of the receiver's runtime environment variables, leaving its other
-/// variables — and the rest of its settings — as they are. The receiver is
-/// `self` or the name of a canister listed in the step's `canisters:` (see
-/// [`resolve_target`]). The options are `{ direct }` and may be omitted or
-/// `null`; `direct` is false by default, which lets the proxy make the update
-/// when one is configured.
-fn canister_setenv_js<'js>(
-    ctx: Ctx<'js>,
-    receiver: Value<'js>,
-    name: String,
-    value: Value<'js>,
-    options: OptArg<Value<'js>>,
-) -> JsResult<()> {
-    let (target, _) = resolve_target(&ctx, Some(&receiver), "canisterSetenv")?;
-    let value = setenv_value(&ctx, &value)?;
-    let direct = setenv_direct(&ctx, options)?;
-
-    let req = SetEnvironmentVariableRequest {
-        target,
-        name,
-        value,
-        direct,
-    };
-    canister_set_environment_variable(&req)
-        .map_err(|e| throw(&ctx, &format!("canisterSetenv failed: {e}")))
-}
-
-/// The trailing options, whose one field is `direct`. Everything else about the
-/// update is positional, so a field this does not know is a mistake worth naming
-/// rather than a setting silently dropped.
-fn setenv_direct<'js>(ctx: &Ctx<'js>, options: OptArg<Value<'js>>) -> JsResult<bool> {
-    let Some(options) = options.0.filter(|v| !v.is_null() && !v.is_undefined()) else {
-        return Ok(false);
-    };
-    let Some(options) = options.as_object() else {
-        return Err(throw(
-            ctx,
-            &format!(
-                "canisterSetenv: options are an object with a `direct` field, got {}",
-                convert::type_name(&options),
-            ),
-        ));
-    };
-
-    let unknown: Vec<String> = options
-        .keys::<String>()
-        .flatten()
-        .filter(|key| key != "direct")
-        .map(|key| format!("`{key}`"))
-        .collect();
-    if !unknown.is_empty() {
-        return Err(throw(
-            ctx,
-            &format!(
-                "canisterSetenv: `direct` is the only option, got {}",
-                unknown.join(", "),
-            ),
-        ));
-    }
-    Ok(options.get::<_, Option<bool>>("direct")?.unwrap_or(false))
-}
-
-/// The value to set, which is a string: the canister reads the variable back
-/// verbatim, so how a value that is not one renders is the script's to say
-/// rather than a coercion's to guess.
-fn setenv_value<'js>(ctx: &Ctx<'js>, value: &Value<'js>) -> JsResult<String> {
-    match value.as_string() {
-        Some(text) => text.to_string(),
-        None => Err(throw(
-            ctx,
-            &format!(
-                "canisterSetenv: a value is a string, got {}; convert it first — `String(x)`, or \
-                 `x.toText()` for a Principal",
-                convert::type_name(value),
-            ),
-        )),
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Encoding helpers, for what the engine itself has no answer to. JSON is native
 // (`JSON.parse`/`JSON.stringify`), and so are hex and base64 — a `Uint8Array`
 // carries `toHex()`/`toBase64()`, with `Uint8Array.fromHex(..)`/`fromBase64(..)`
@@ -641,6 +540,16 @@ fn inject_inputs(ctx: &Ctx<'_>, input: &SyncExecInput) -> JsResult<()> {
     globals.set("identityId", input.identity_principal.clone())?;
     globals.set("identity", Principal::from(identity))?;
 
+    // Where the network is reached. The plugin has no sockets, so these are for
+    // composing a URL to hand to a canister or to print, not for fetching.
+    globals.set("apiUrl", input.api_url.clone())?;
+    match &input.gateway_url {
+        Some(url) => globals.set("gatewayUrl", url.clone())?,
+        // Explicitly `null`, so a network with no gateway reads as a value the
+        // host passed rather than as an unset global — as `proxy` does below.
+        None => globals.set("gatewayUrl", Value::new_null(ctx.clone()))?,
+    }
+
     match &input.proxy_canister_id {
         Some(text) => {
             let p = CandidPrincipal::from_text(text).map_err(|e| {
@@ -662,16 +571,16 @@ fn inject_inputs(ctx: &Ctx<'_>, input: &SyncExecInput) -> JsResult<()> {
         "files",
         string_map(ctx, input.files.iter().map(|f| (&f.name, &f.content)))?,
     )?;
-    // The manifest keys `dirs:`/`files:` were declared under, if any, grouped for
-    // lookup: a key maps to every path declared beneath it, in declaration order.
-    // Plain-list entries carry no key and appear only in `dirs`/`files`.
+    // The manifest keys the `files:` entries were declared under, grouped for
+    // lookup: a key maps to every path declared beneath it, in declaration
+    // order. Every entry has one, split between the two by what is on disk.
     globals.set(
         "dirKeys",
-        group_by_key(ctx, input.dirs.iter().map(|d| (d.key.as_deref(), &d.path)))?,
+        group_by_key(ctx, input.dirs.iter().map(|d| (&d.key, &d.path)))?,
     )?;
     globals.set(
         "fileKeys",
-        group_by_key(ctx, input.files.iter().map(|f| (f.key.as_deref(), &f.name)))?,
+        group_by_key(ctx, input.files.iter().map(|f| (&f.key, &f.name)))?,
     )?;
     globals.set(
         "fields",
@@ -699,21 +608,20 @@ fn string_map<'js, 'a>(
     Ok(obj)
 }
 
-/// Group declared paths by the manifest map key they were declared under,
-/// dropping the entries that have none. Each key maps to an array of paths in
-/// declaration order, since one key may name several paths.
+/// Group declared paths by the manifest map key they were declared under. Each
+/// key maps to an array of paths in declaration order, since one key may name
+/// several paths.
 fn group_by_key<'js, 'a>(
     ctx: &Ctx<'js>,
-    entries: impl Iterator<Item = (Option<&'a str>, &'a String)>,
+    entries: impl Iterator<Item = (&'a String, &'a String)>,
 ) -> JsResult<Object<'js>> {
     // Grouped in Rust first, so the keys are written to the object exactly once
     // and never read back through its prototype chain.
     let mut grouped: Vec<(&str, Vec<&str>)> = Vec::new();
     for (key, path) in entries {
-        let Some(key) = key else { continue };
         match grouped.iter_mut().find(|(k, _)| *k == key) {
             Some((_, paths)) => paths.push(path),
-            None => grouped.push((key, vec![path.as_str()])),
+            None => grouped.push((key.as_str(), vec![path.as_str()])),
         }
     }
 
@@ -769,34 +677,36 @@ mod tests {
     use crate::{DirInput, FieldInput, FileInput};
 
     /// A step declaring the entry script under the `script` file key, two files
-    /// under a shared `seed` key, and one keyed and one plain-list directory.
+    /// under a shared `seed` key, and two directories.
     fn input(script: &str) -> SyncExecInput {
         SyncExecInput {
             canister_id: "ryjl3-tyaaa-aaaaa-aaaba-cai".to_string(),
             environment: "local".to_string(),
+            api_url: "http://127.0.0.1:4943/".to_string(),
+            gateway_url: Some("http://localhost:4943/".to_string()),
             dirs: vec![
                 DirInput {
-                    key: Some("assets".into()),
+                    key: "assets".into(),
                     path: "assets".into(),
                 },
                 DirInput {
-                    key: None,
-                    path: "plain".into(),
+                    key: "vendor".into(),
+                    path: "vendor".into(),
                 },
             ],
             files: vec![
                 FileInput {
-                    key: Some("script".into()),
+                    key: "script".into(),
                     name: "sync.js".into(),
                     content: script.into(),
                 },
                 FileInput {
-                    key: Some("seed".into()),
+                    key: "seed".into(),
                     name: "a.json".into(),
                     content: "1".into(),
                 },
                 FileInput {
-                    key: Some("seed".into()),
+                    key: "seed".into(),
                     name: "b.json".into(),
                     content: "2".into(),
                 },
@@ -824,19 +734,31 @@ mod tests {
             ("identityId", "identityId === `${identity}`"),
             ("environment", "environment === 'local'"),
             ("proxy", "proxy === null"),
+            ("apiUrl", "apiUrl === 'http://127.0.0.1:4943/'"),
+            ("gatewayUrl", "gatewayUrl === 'http://localhost:4943/'"),
             ("fields", "fields.mode === 'fast'"),
             ("canisterIds", "Object.keys(canisterIds).length === 0"),
         ]);
     }
 
+    /// A network with no HTTP gateway leaves `gatewayUrl` null rather than
+    /// unset, the way an absent proxy does.
+    #[test]
+    fn a_network_without_a_gateway_reports_none() {
+        let mut input = input("if (gatewayUrl !== null) throw 'gatewayUrl';");
+        input.gateway_url = None;
+        run(input).unwrap();
+    }
+
     #[test]
     fn declared_dirs_and_files_are_visible() {
         assert_script(&[
-            // Plain-list entries appear in `dirs`/`files` but under no key.
-            ("dirs", "JSON.stringify(dirs) === '[\"assets\",\"plain\"]'"),
+            // Every entry carries the key it was declared under, and the host
+            // splits them by what it found on disk.
+            ("dirs", "JSON.stringify(dirs) === '[\"assets\",\"vendor\"]'"),
             (
                 "dirKeys",
-                "JSON.stringify(dirKeys) === '{\"assets\":[\"assets\"]}'",
+                "JSON.stringify(dirKeys) === '{\"assets\":[\"assets\"],\"vendor\":[\"vendor\"]}'",
             ),
             // One key may name several files, and the entry script stays visible.
             (
@@ -854,7 +776,7 @@ mod tests {
     #[test]
     fn script_field_is_an_alternative_to_a_script_file() {
         let mut input = input("");
-        input.files.retain(|f| f.key.as_deref() != Some("script"));
+        input.files.retain(|f| f.key != "script");
         input.fields.push(FieldInput {
             name: "script".into(),
             value: "if (Object.keys(fileKeys).length !== 1) throw 'fileKeys';".into(),
@@ -876,7 +798,7 @@ mod tests {
     fn a_script_key_naming_two_files_is_an_error() {
         let mut input = input("");
         input.files.push(FileInput {
-            key: Some("script".into()),
+            key: "script".into(),
             name: "other.js".into(),
             content: String::new(),
         });
@@ -886,7 +808,7 @@ mod tests {
     #[test]
     fn declaring_no_script_is_an_error() {
         let mut input = input("");
-        input.files.retain(|f| f.key.as_deref() != Some("script"));
+        input.files.retain(|f| f.key != "script");
         assert!(run(input).unwrap_err().contains("no script provided"));
     }
 
@@ -908,33 +830,6 @@ mod tests {
             (
                 "callUpdate(self, 'go', 'nope');",
                 "callUpdate `arg`: expected a Uint8Array or a CandidArgs",
-            ),
-        ] {
-            let reported = crate::testing::error(script);
-            assert!(reported.contains(expected), "{script}\n{reported}");
-        }
-    }
-
-    /// `canisterSetenv` names its receiver first too. The update needs a host
-    /// to make it, so what a test reaches is the checking that precedes it.
-    #[test]
-    fn setenv_names_its_receiver_first() {
-        for (script, expected) in [
-            (
-                "canisterSetenv('ryjl3-tyaaa-aaaaa-aaaba-cai', 'SEEDED_BY', 'local');",
-                "canisterSetenv: a target is `self` or the name of a canister listed",
-            ),
-            (
-                "canisterSetenv(self, 'SEEDED_BY', 7);",
-                "canisterSetenv: a value is a string, got a number",
-            ),
-            (
-                "canisterSetenv(self, 'SEEDED_BY', undefined);",
-                "canisterSetenv: a value is a string, got undefined",
-            ),
-            (
-                "canisterSetenv(self, 'SEEDED_BY', 'local', { target: 'ledger' });",
-                "canisterSetenv: `direct` is the only option, got `target`",
             ),
         ] {
             let reported = crate::testing::error(script);
